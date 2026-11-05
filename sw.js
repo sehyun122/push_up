@@ -1,7 +1,7 @@
 // Keeps the 15MB pose model and engine on the phone after the first visit,
 // so later runs start fast and work on weak connections.
-const CACHE = 'pushup-v1';
-const HEAVY = ['lib/vision_bundle.js', 'lib/vision_wasm_internal.js', 'lib/vision_wasm_internal.wasm', 'model/pose_landmarker_lite.task'];
+const CACHE = 'pushup-v2';
+const HEAVY = ['lib/vision_bundle.js', 'lib/vision_wasm_internal.js', 'lib/vision_wasm_internal.wasm', 'model/pose_landmarker_lite.task', 'model/pose_landmarker_full.task'];
 
 self.addEventListener('install', (e) => { self.skipWaiting(); });
 self.addEventListener('activate', (e) => {

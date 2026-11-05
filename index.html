@@ -210,6 +210,14 @@ input[type="text"] { width: 100%; padding: 9px 12px; border-radius: 10px; border
             <div class="range-meta"><span>깊게 내려간 것만</span><span>얕아도 인정</span></div>
           </div>
         </div>
+        <div class="field">
+          <span class="lbl">인식 모델</span>
+          <div class="seg" role="radiogroup" aria-label="인식 모델">
+            <label><input type="radio" name="model" value="full"><span>정확하게</span></label>
+            <label><input type="radio" name="model" value="lite"><span>빠르게</span></label>
+          </div>
+          <p class="small">정확하게는 분석이 1.5~2배 느려요. 바꾸면 영상을 다시 분석해요.</p>
+        </div>
       </section>
 
       <section class="card" aria-labelledby="h-cap">
@@ -280,7 +288,7 @@ const video = $('#src');
 const tl = $('#tl'), tctx = tl.getContext('2d');
 
 /* ---------- settings ---------- */
-const DEFAULTS = { style: 'block', pos: 'top', fmt: 'n', size: 1, label: '', zero: true, pop: true, timing: 'top', sens: 0.6 };
+const DEFAULTS = { style: 'block', pos: 'top', fmt: 'n', size: 1, label: '', zero: true, pop: true, timing: 'top', sens: 0.6, model: 'full' };
 let S = { ...DEFAULTS };
 try { Object.assign(S, JSON.parse(localStorage.getItem('pushup-caption-v2') || '{}')); } catch (e) {}
 function saveSettings() { try { localStorage.setItem('pushup-caption-v2', JSON.stringify(S)); } catch (e) {} }
@@ -291,7 +299,7 @@ function bindRadio(name) {
     el.addEventListener('change', () => { S[name] = el.value; saveSettings(); onSettings(name); });
   });
 }
-['style', 'pos', 'fmt', 'timing'].forEach(bindRadio);
+['style', 'pos', 'fmt', 'timing', 'model'].forEach(bindRadio);
 $('#size').value = S.size; $('#size').addEventListener('input', (e) => { S.size = +e.target.value; saveSettings(); onSettings('size'); });
 $('#sens').value = S.sens; $('#sens').addEventListener('input', (e) => { S.sens = +e.target.value; saveSettings(); onSettings('sens'); });
 $('#label').value = S.label; $('#label').addEventListener('input', (e) => { S.label = e.target.value; saveSettings(); onSettings('label'); });
@@ -300,6 +308,7 @@ $('#pop').checked = S.pop; $('#pop').addEventListener('change', (e) => { S.pop =
 
 function onSettings(name) {
   if (name === 'sens' && st.samples.length) { recount(); }
+  if (name === 'model' && st.loaded && !st.exporting && !st.busy) { analyze(); return; }
   if (name === 'timing') { st.selected = -1; updateResult(); }
   drawStage(); drawTimeline(); drawChips();
 }
@@ -559,19 +568,19 @@ async function loadFile(f) {
 }
 
 /* ---------- pose model ---------- */
-let poseP = null, tsCounter = 0;
+const poseP = {}; let tsCounter = 0;
 const abs = (p) => new URL(p, location.href).href;
-function getPose() {
-  if (poseP) return poseP;
-  poseP = (async () => {
+function getPose(kind) {
+  if (poseP[kind]) return poseP[kind];
+  const p = (async () => {
     const mod = await import(abs('lib/vision_bundle.js'));
     const fileset = { wasmLoaderPath: abs('lib/vision_wasm_internal.js'), wasmBinaryPath: abs('lib/vision_wasm_internal.wasm') };
-    const opts = (delegate) => ({ baseOptions: { modelAssetPath: abs('model/pose_landmarker_lite.task'), delegate }, runningMode: 'VIDEO', numPoses: 1, minPoseDetectionConfidence: 0.4, minPosePresenceConfidence: 0.4, minTrackingConfidence: 0.4 });
+    const opts = (delegate) => ({ baseOptions: { modelAssetPath: abs(`model/pose_landmarker_${kind}.task`), delegate }, runningMode: 'VIDEO', numPoses: 1, minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5 });
     try { return await mod.PoseLandmarker.createFromOptions(fileset, opts('GPU')); }
     catch (e) { return await mod.PoseLandmarker.createFromOptions(fileset, opts('CPU')); }
   })();
-  poseP.catch(() => { poseP = null; });
-  return poseP;
+  poseP[kind] = p; p.catch(() => { delete poseP[kind]; });
+  return p;
 }
 
 function angleAt(a, b, c, ar) {
@@ -581,7 +590,7 @@ function angleAt(a, b, c, ar) {
 }
 function features(lm, ar) {
   const vis = (i) => lm[i].visibility ?? 1;
-  const NONE = { ang: NaN, ok: false };
+  const NONE = { ang: NaN, sh: NaN, ok: false };
   const sides = [[11, 13, 15, 23], [12, 14, 16, 24]].map(([s, e, w, h]) => ({
     s, e, w, h, v: Math.min(vis(s), vis(e), vis(w)), hv: vis(h), ang: angleAt(lm[s], lm[e], lm[w], ar),
   }));
@@ -597,38 +606,97 @@ function features(lm, ar) {
   const torso = Math.hypot(dx, dy);
   const horizontal = dy < dx * 1.2;
   const handsDown = W.y > S.y - torso * 0.15;
-  return { ang, ok: horizontal && handsDown && Number.isFinite(ang) };
+  // shoulder height above the hands, in torso lengths: big at the top, small at the bottom
+  const sh = use.reduce((a, x) => a + ((lm[x.w].y - lm[x.s].y) / torso) * x.v, 0) / use.reduce((a, x) => a + x.v, 0);
+  return { ang, sh, ok: horizontal && handsDown && Number.isFinite(ang) && torso > 0.02 };
 }
 
-const SAMPLE_HZ = 12;
 let analyzeToken = 0;
+const hasRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+
+// Plays the clip silently and analyses every frame the browser actually presents.
+// Playback speed adapts so we keep ~20 samples per second of video even on slow phones.
+function analyzeByPlayback(token, onSample) {
+  return new Promise(async (resolve) => {
+    video.pause(); const wasMuted = video.muted; video.muted = true;
+    await seekAwait(0);
+    video.playbackRate = 1;
+    let finished = false, lastMedia = -1, frames = 0, detMs = 0, lastSeen = -1, still = 0;
+    const finish = (ok) => {
+      if (finished) return; finished = true;
+      clearInterval(watch); video.removeEventListener('ended', onEnd);
+      video.pause(); video.muted = wasMuted; video.playbackRate = 1; resolve(ok);
+    };
+    const onEnd = () => finish(true);
+    const cb = (now, meta) => {
+      if (finished) return;
+      if (token !== analyzeToken) return finish(false);
+      const t = meta.mediaTime;
+      if (t > lastMedia + 0.02) {
+        lastMedia = t;
+        const t0 = performance.now(); onSample(t); detMs += performance.now() - t0; frames++;
+        if (frames % 12 === 0) {
+          const target = Math.min(2, Math.max(0.3, 1000 / (detMs / frames) / 20));
+          if (Math.abs(target - video.playbackRate) > 0.1) video.playbackRate = target;
+        }
+        setBusy(true, '자세 분석 중', t / st.duration);
+      }
+      video.requestVideoFrameCallback(cb);
+    };
+    video.addEventListener('ended', onEnd);
+    // bail out if playback stops making progress (e.g. the phone suspended the tab)
+    const watch = setInterval(() => {
+      if (video.currentTime === lastSeen && !video.ended) { if (++still >= 6) finish('stall'); } else { still = 0; lastSeen = video.currentTime; }
+    }, 1000);
+    video.requestVideoFrameCallback(cb);
+    try { await video.play(); } catch (e) { finish('noplay'); }
+  });
+}
+
+async function analyzeBySeeking(token, onSample) {
+  const HZ = 15, total = Math.ceil(st.duration * HZ);
+  for (let i = 0; i < total; i++) {
+    if (token !== analyzeToken) return false;
+    const t = Math.min(i / HZ, st.duration - 0.02);
+    await seekAwait(t);
+    onSample(t);
+    if (i % 2 === 0) { drawStage(); drawTimeline(); setBusy(true, '자세 분석 중', (i + 1) / total); }
+  }
+  return true;
+}
+
 async function analyze() {
   const token = ++analyzeToken;
-  st.busy = true; setBusy(true, '분석 모델 불러오는 중', 0); setButtons();
+  video.pause();
+  st.busy = true; st.samples = []; st.signal = null; st.reps = []; st.selected = -1;
+  setBusy(true, '분석 모델 불러오는 중', 0); setButtons();
   setStatus('자세 인식 모델을 불러오는 중이에요. 처음 한 번은 몇 초 걸려요.');
   let pose;
-  try { pose = await getPose(); }
+  try { pose = await getPose(S.model); }
   catch (e) {
     console.error(e);
     st.busy = false; setBusy(false); setButtons();
     setStatus('자세 인식 모델을 불러오지 못했어요. 타임라인에서 직접 +1로 카운트를 넣을 수 있어요.', true);
-    st.signal = null; updateResult(); frame(); return;
+    updateResult(); frame(); return;
   }
   if (token !== analyzeToken) return;
-  setStatus('프레임마다 몸 자세와 팔꿈치 각도를 재고 있어요.');
+  setStatus('영상을 처음부터 훑으면서 몸 자세, 팔꿈치 각도, 어깨 높이를 재고 있어요. 분석이 끝날 때까지 화면을 켜 두세요.');
   const ar = video.videoWidth / video.videoHeight;
-  const step = 1 / SAMPLE_HZ; const total = Math.ceil(st.duration * SAMPLE_HZ);
-  const samples = [];
-  for (let i = 0; i < total; i++) {
-    if (token !== analyzeToken) return;
-    const t = Math.min(i * step, st.duration - 0.02);
-    await seekAwait(t);
-    tsCounter += 1000 / SAMPLE_HZ;
-    let f = { ang: NaN, ok: false }; let lm = null;
+  let samples = [];
+  const onSample = (t) => {
+    tsCounter += 33;
+    let f = { ang: NaN, sh: NaN, ok: false }; let lm = null;
     try { const r = pose.detectForVideo(video, tsCounter); lm = r.landmarks?.[0] || null; if (lm) f = features(lm, ar); } catch (e) { console.warn(e); }
-    samples.push({ t, ...f });
-    st.samples = samples; st.lastLm = lm;
-    if (i % 2 === 0 || i === total - 1) { drawStage(); drawTimeline(); setBusy(true, '자세 분석 중', (i + 1) / total); updateTransport(); }
+    samples.push({ t, ...f }); st.samples = samples; st.lastLm = lm;
+  };
+  let ok = false;
+  if (hasRVFC) ok = await analyzeByPlayback(token, onSample);
+  if (token !== analyzeToken) return;
+  // too few frames means playback did not really run; redo by seeking
+  if (!ok || samples.length < st.duration * 8) {
+    samples = []; st.samples = [];
+    ok = await analyzeBySeeking(token, onSample);
+    if (token !== analyzeToken) return;
   }
   st.busy = false; st.lastLm = null; setBusy(false);
   recount();
@@ -636,39 +704,92 @@ async function analyze() {
 }
 
 /* ---------- rep counting ----------
-   Only frames where a person is found in push-up posture count.
-   Inside those stretches, a rep = elbow bends by at least P degrees and straightens back by P degrees. */
-const MAX_GAP = 3;     // frames (~0.25 s) of missed detection we bridge
-const MIN_SEG = 6;     // frames (~0.5 s) a posture stretch must last
-function smoothSeg(a) {
-  const med = a.map((_, i) => { const w = [a[i - 1] ?? a[i], a[i], a[i + 1] ?? a[i]].sort((x, y) => x - y); return w[1]; });
-  return med.map((_, i) => { let s = 0, n = 0; for (let k = -1; k <= 1; k++) if (med[i + k] !== undefined) { s += med[i + k]; n++; } return s / n; });
+   1. Keep only stretches where a person is in push-up posture (body level, hands under shoulders).
+   2. Two signals per frame: elbow angle and shoulder height. Both drop at the bottom of a rep.
+   3. Each signal is scaled by the typical rep size found in this video, so deep and shallow
+      push-ups both land near 1.0. The cleaner signal gets more weight; a noisy one is dropped.
+   4. A rep = the fused signal falls by P and rises back by P (P set by the sensitivity slider). */
+const MAX_GAP_S = 0.3;   // bridge missed detections shorter than this
+const MIN_SEG_S = 0.6;   // a posture stretch must last at least this long
+const CH = { ang: { minA: 10, p0: 6 }, sh: { minA: 0.05, p0: 0.03 } };
+
+function segmentsOf(samples) {
+  const segs = []; let a = -1, lastOk = -1;
+  for (let i = 0; i < samples.length; i++) {
+    if (!samples[i].ok) continue;
+    if (a === -1) a = i;
+    else if (samples[i].t - samples[lastOk].t > MAX_GAP_S) { segs.push([a, lastOk]); a = i; }
+    lastOk = i;
+  }
+  if (a !== -1) segs.push([a, lastOk]);
+  return segs.filter(([x, y]) => samples[y].t - samples[x].t >= MIN_SEG_S);
 }
+function channel(samples, segs, key) {
+  const n = samples.length, out = new Array(n).fill(NaN), t = samples.map((s) => s.t);
+  for (const [a, b] of segs) {
+    // interpolate the gaps inside a stretch
+    const raw = []; let prev = -1;
+    for (let i = a; i <= b; i++) {
+      const v = samples[i].ok ? samples[i][key] : NaN;
+      raw.push(v);
+      if (Number.isFinite(v)) {
+        if (prev >= 0 && i - prev > 1) for (let j = prev + 1; j < i; j++) raw[j - a] = raw[prev - a] + ((v - raw[prev - a]) * (t[j] - t[prev])) / (t[i] - t[prev]);
+        prev = i;
+      }
+    }
+    // median of 3, then mean over ±70 ms
+    const med = raw.map((v, k) => { const w = [raw[k - 1] ?? v, v, raw[k + 1] ?? v].sort((x, y) => x - y); return w[1]; });
+    for (let k = 0; k < med.length; k++) {
+      let s = 0, c = 0;
+      for (let q = k; q >= 0 && t[a + k] - t[a + q] <= 0.07; q--) { s += med[q]; c++; }
+      for (let q = k + 1; q < med.length && t[a + q] - t[a + k] <= 0.07; q++) { s += med[q]; c++; }
+      out[a + k] = s / c;
+    }
+  }
+  return out;
+}
+// size of each down/up swing (peak before the drop → following valley), using a small fixed threshold
+function swings(vals, segs, p0) {
+  const res = [];
+  for (const [a, b] of segs) {
+    let state = 'up', hi = vals[a], lo = Infinity, dropHi = 0;
+    for (let i = a; i <= b; i++) {
+      const v = vals[i];
+      if (state === 'up') { if (v > hi) hi = v; if (hi - v >= p0) { state = 'down'; lo = v; dropHi = hi; } }
+      else { if (v < lo) lo = v; if (v - lo >= p0) { res.push(dropHi - lo); state = 'up'; hi = v; } }
+    }
+  }
+  return res;
+}
+const pct = (a, p) => { const s = a.filter(Number.isFinite).sort((x, y) => x - y); if (!s.length) return NaN; return s[Math.min(s.length - 1, Math.max(0, Math.round((p / 100) * (s.length - 1))))]; };
+
 function buildSignal() {
-  const n = st.samples.length; if (!n) return null;
-  const times = st.samples.map((s) => s.t);
-  const raw = st.samples.map((s) => (s.ok ? s.ang : NaN));
-  // bridge short gaps
-  let last = -1;
-  for (let i = 0; i < n; i++) {
-    if (!Number.isFinite(raw[i])) continue;
-    if (last >= 0 && i - last > 1 && i - last - 1 <= MAX_GAP) for (let j = last + 1; j < i; j++) raw[j] = raw[last] + ((raw[i] - raw[last]) * (j - last)) / (i - last);
-    last = i;
+  const samples = st.samples; if (!samples.length) return null;
+  const segs = segmentsOf(samples); if (!segs.length) return null;
+  const times = samples.map((s) => s.t);
+  const chans = [];
+  for (const key of Object.keys(CH)) {
+    const vals = channel(samples, segs, key);
+    const sw = swings(vals, segs, CH[key].p0);
+    const A = sw.length >= 2 ? pct(sw, 75) : pct(vals, 95) - pct(vals, 5);
+    if (!(A >= CH[key].minA)) continue;
+    const d2 = []; for (const [a, b] of segs) for (let i = a + 1; i < b; i++) d2.push(Math.abs(vals[i + 1] - 2 * vals[i] + vals[i - 1]));
+    const noise = pct(d2, 50) || A * 1e-3;
+    chans.push({ key, vals, A, mid: pct(vals, 50), q: A / noise });
   }
-  const segs = []; let i = 0;
-  while (i < n) {
-    if (!Number.isFinite(raw[i])) { i++; continue; }
-    let j = i; while (j + 1 < n && Number.isFinite(raw[j + 1])) j++;
-    if (j - i + 1 >= MIN_SEG) segs.push([i, j]);
-    i = j + 1;
-  }
-  if (!segs.length) return null;
-  const vals = new Array(n).fill(NaN);
-  for (const [a, b] of segs) { const sm = smoothSeg(raw.slice(a, b + 1)); for (let k = a; k <= b; k++) vals[k] = sm[k - a]; }
-  return { times, vals, segs, lo: 50, hi: 185 };
+  if (!chans.length) return null;
+  const qmax = Math.max(...chans.map((c) => c.q));
+  const used = chans.filter((c) => c.q >= qmax * 0.35);
+  const wsum = used.reduce((a, c) => a + c.q, 0);
+  const vals = times.map((_, i) => {
+    if (!Number.isFinite(used[0].vals[i])) return NaN;
+    return used.reduce((a, c) => a + (c.q * (c.vals[i] - c.mid)) / c.A, 0) / wsum;
+  });
+  return { times, vals, segs, used: used.map((c) => c.key), lo: pct(vals, 1) - 0.15, hi: pct(vals, 99) + 0.15 };
 }
+
 function countReps(sig, sens) {
-  const P = 34 - 22 * sens; // degrees of bend needed: 34° strict … 12° loose
+  const P = Math.max(0.2, 0.62 - 0.4 * sens); // fraction of a typical rep: 0.62 strict … 0.22 loose
   sig.P = P;
   const { times, vals } = sig; const reps = [];
   for (const [a, b] of sig.segs) {
@@ -681,10 +802,10 @@ function countReps(sig, sens) {
       } else {
         if (v < minV) { minV = v; minT = t; }
         if (v - minV >= P) {
-          // top = first moment the arm is (nearly) as straight as it gets in the next 1.2 s
+          // top = first moment the body is (nearly) as high as it gets in the next 1.2 s
           let mx = v, k = i;
           while (k + 1 <= b && times[k + 1] - t <= 1.2) { k++; mx = Math.max(mx, vals[k]); }
-          let topI = i; for (let q = i; q <= k; q++) if (vals[q] >= mx - 6) { topI = q; break; }
+          let topI = i; for (let q = i; q <= k; q++) if (vals[q] >= mx - 0.12) { topI = q; break; }
           const top = times[topI];
           const prev = reps[reps.length - 1];
           if (!prev || top - prev.top > 0.4) reps.push({ bottom: minT, top });
@@ -700,8 +821,10 @@ function recount() {
   st.reps = st.signal ? countReps(st.signal, S.sens) : [];
   if (!st.signal) setStatus('푸시업 자세를 찾지 못했어요. 머리부터 발끝까지 옆에서 보이게 찍으면 잘 잡혀요. 타임라인에서 직접 +1로 넣을 수도 있어요.', true);
   else {
-    const covered = st.signal.segs.reduce((a, [x, y]) => a + (y - x + 1), 0) / st.samples.length;
-    setStatus(`${st.reps.length}회를 찾았어요. 푸시업 자세가 잡힌 구간(타임라인 색칠된 부분, 전체의 ${Math.round(covered * 100)}%)에서만 셌어요. 틀린 곳은 타임라인에서 고치면 돼요.`);
+    const dur = st.signal.segs.reduce((a, [x, y]) => a + (st.samples[y].t - st.samples[x].t), 0);
+    const names = { ang: '팔꿈치 각도', sh: '어깨 높이' };
+    const rate = st.samples.length / Math.max(0.1, st.duration);
+    setStatus(`${st.reps.length}회를 찾았어요. 푸시업 자세가 잡힌 구간(타임라인 색칠된 부분, 전체의 ${Math.round((dur / st.duration) * 100)}%)에서 ${st.signal.used.map((k) => names[k]).join('+')}로 셌어요. 초당 ${rate.toFixed(0)}프레임 분석. 틀린 곳은 타임라인에서 고치면 돼요.`);
   }
   updateResult(); drawTimeline(); drawStage();
 }
@@ -802,6 +925,7 @@ function setButtons() {
   $('#playBtn').disabled = !ready;
   $('#pickBtn2').disabled = st.busy || st.exporting;
   $('#sens').disabled = !ready || !st.samples.length;
+  document.querySelectorAll('input[name="model"]').forEach((el) => { el.disabled = st.busy || st.exporting; });
   updateEditButtons(); updateResult();
 }
 
@@ -814,6 +938,7 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', drawTime
 new MutationObserver(drawTimeline).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 // warm the model in the background so the first analysis starts faster
 setTimeout(() => { getPose().catch(() => {}); }, 1500);
+
 if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 </script>
 </body>

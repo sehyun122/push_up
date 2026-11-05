@@ -23,7 +23,7 @@
 - 아이폰 사파리: 주소 열기 → 공유 버튼 → "홈 화면에 추가"
 - 안드로이드 크롬: 주소 열기 → 메뉴(⋮) → "홈 화면에 추가" 또는 "앱 설치"
 
-첫 실행 때 인식 모델(약 15MB)을 받아 두고, 그다음부터는 폰에 저장된 걸 써서 빨리 뜬다.
+첫 실행 때 인식 엔진과 모델(약 20MB)을 받아 두고, 그다음부터는 폰에 저장된 걸 써서 빨리 뜬다.
 
 ## 파일 구성
 
@@ -31,10 +31,11 @@
 | --- | --- |
 | `index.html` | 앱 전체 (UI, 카운트 로직, 자막 렌더링, 녹화) |
 | `lib/` | MediaPipe tasks-vision 0.10.21 (JS + WASM) |
-| `model/pose_landmarker_lite.task` | 자세 인식 모델 |
+| `model/pose_landmarker_full.task` | 자세 인식 모델 (정확하게, 기본값) |
+| `model/pose_landmarker_lite.task` | 자세 인식 모델 (빠르게) |
 | `sw.js` | 모델·엔진을 폰에 캐시하는 서비스 워커 |
 | `manifest.webmanifest`, `icons/` | 홈 화면 추가용 |
 
 ## 수정했을 때
 
-`index.html`만 바꿨으면 그냥 push하면 된다. `lib/`나 `model/`을 바꿨으면 `sw.js`의 `CACHE` 이름(`pushup-v1`)을 올려야 폰에 남은 옛 파일이 교체된다.
+`index.html`만 바꿨으면 그냥 push하면 된다. `lib/`나 `model/`을 바꿨으면 `sw.js`의 `CACHE` 이름(`pushup-v2`)을 올려야 폰에 남은 옛 파일이 교체된다.
